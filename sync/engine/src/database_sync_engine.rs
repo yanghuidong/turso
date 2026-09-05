@@ -699,8 +699,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
                 || file.storage != expected_storage
             {
                 return Err(Error::DatabaseSyncEngineError(format!(
-                    "replace-base recovery marker contains an invalid file entry: {:?}",
-                    file
+                    "replace-base recovery marker contains an invalid file entry: {file:?}"
                 )));
             }
         }
@@ -2135,8 +2134,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
 
-        if file.value.size()? == 0
-            && !matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages)
+        if file.value.size()? == 0 && !matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages)
         {
             tracing::info!(
                 "wait_changes(path={}): no changes detected",
@@ -2226,13 +2224,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             DbChangesStreamKind::ReplaceBasePages
         );
         let mut replace_base_guard = if replace_base {
+            let synced_revision = self.meta().synced_revision.clone();
             Some(
                 ReplaceBaseApplyGuard::create(
                     coro,
                     self.io.clone(),
                     self.sync_engine_io.clone(),
                     &self.main_db_path,
-                    self.meta().synced_revision.clone(),
+                    synced_revision,
                 )
                 .await?,
             )
@@ -3973,14 +3972,8 @@ mod tests {
                     &main_path,
                     Arc::new(SqliteDialect),
                 )?;
-                let reopened = DatabaseSyncEngine::open_db(
-                    &coro,
-                    io,
-                    sync_stats,
-                    reopened_db,
-                    opts,
-                )
-                .await?;
+                let reopened =
+                    DatabaseSyncEngine::open_db(&coro, io, sync_stats, reopened_db, opts).await?;
                 assert_eq!(reopened.meta().revert_since_wal_watermark, 0);
                 assert!(reopened.meta().revert_since_wal_salt.is_none());
                 let conn = reopened.connect_rw(&coro).await?;
