@@ -539,15 +539,26 @@ impl DatabaseReplayGenerator {
                 pk_column_names.push(quote_ident(&record_columns[idx]));
             }
             let mut update_clauses = Vec::new();
-            for name in record_columns {
+            let mut changed_columns = Vec::new();
+            for (idx, name) in record_columns.iter().enumerate() {
                 let name = quote_ident(name);
-                update_clauses.push(format!("{name} = excluded.{name}"));
+                if rowid_alias_pk_column_index != Some(idx) {
+                    update_clauses.push(format!("{name} = excluded.{name}"));
+                }
+                changed_columns.push(format!(
+                    "typeof({name}) IS NOT typeof(excluded.{name}) OR {name} IS NOT excluded.{name} COLLATE BINARY"
+                ));
             }
-            format!(
-                " ON CONFLICT({}) DO UPDATE SET {}",
-                pk_column_names.join(","),
-                update_clauses.join(",")
-            )
+            if update_clauses.is_empty() {
+                format!(" ON CONFLICT({}) DO NOTHING", pk_column_names.join(","))
+            } else {
+                format!(
+                    " ON CONFLICT({}) DO UPDATE SET {} WHERE {}",
+                    pk_column_names.join(","),
+                    update_clauses.join(","),
+                    changed_columns.join(" OR ")
+                )
+            }
         } else {
             String::new()
         };
@@ -1029,10 +1040,11 @@ mod tests {
     ) -> Result<ReplayInfo> {
         let temp_file = NamedTempFile::new().unwrap();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = turso_core::Database::open_file(
+        let db = turso_core::Database::open(
             io.clone(),
             temp_file.path().to_str().unwrap(),
-            Arc::new(SqliteDialect),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true)),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -1092,6 +1104,54 @@ mod tests {
             r#"UPDATE "t" SET "b" = ? WHERE "c" IS ? AND "a" IS ?"#
         );
         assert_eq!(update.pk_column_indices, Some(vec![2, 0]));
+    }
+
+    #[test]
+    fn test_upsert_skips_only_rowid_alias_assignment() {
+        let cases = [
+            (
+                "CREATE TABLE t (singleton INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT",
+                2,
+                r#"INSERT INTO "t"("singleton", "v") VALUES (?,?) ON CONFLICT("singleton") DO UPDATE SET "v" = excluded."v""#,
+            ),
+            (
+                "CREATE TABLE t (derived TEXT AS (v || '!') VIRTUAL, singleton INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT",
+                2,
+                r#"INSERT INTO "t"("singleton", "v") VALUES (?,?) ON CONFLICT("singleton") DO UPDATE SET "v" = excluded."v""#,
+            ),
+            (
+                "CREATE TABLE t (singleton INTEGER PRIMARY KEY) STRICT",
+                1,
+                r#"INSERT INTO "t"("singleton") VALUES (?) ON CONFLICT("singleton") DO NOTHING"#,
+            ),
+            (
+                "CREATE TABLE t (key BLOB PRIMARY KEY, v TEXT)",
+                2,
+                r#"INSERT INTO "t"("key", "v") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "key" = excluded."key","v" = excluded."v""#,
+            ),
+            (
+                "CREATE TABLE t (a TEXT, v TEXT, b BLOB, PRIMARY KEY (b, a))",
+                3,
+                r#"INSERT INTO "t"("a", "v", "b") VALUES (?,?,?) ON CONFLICT("b","a") DO UPDATE SET "a" = excluded."a","v" = excluded."v","b" = excluded."b""#,
+            ),
+            (
+                "CREATE TABLE t (key TEXT PRIMARY KEY COLLATE NOCASE, v TEXT)",
+                2,
+                r#"INSERT INTO "t"("key", "v") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "key" = excluded."key","v" = excluded."v""#,
+            ),
+        ];
+        for (ddl, columns, expected) in cases {
+            let info = replay_info_for(&[ddl], "t", QueryKind::Upsert(columns), false).unwrap();
+            if expected.ends_with("DO NOTHING") {
+                assert_eq!(info.query, expected, "schema: {ddl}");
+            } else {
+                assert!(
+                    info.query.starts_with(&format!("{expected} WHERE ")),
+                    "schema: {ddl}, query: {}",
+                    info.query
+                );
+            }
+        }
     }
 
     #[test]

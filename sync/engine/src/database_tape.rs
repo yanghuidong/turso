@@ -1131,6 +1131,159 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_upserts_existing_integer_and_collated_text_keys() {
+        for (preference_schema, preference_query) in [
+            (
+                "CREATE TABLE preference (singleton INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT",
+                "SELECT singleton, value FROM preference",
+            ),
+            (
+                "CREATE TABLE preference (derived TEXT AS (value || '!') VIRTUAL, singleton INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT",
+                "SELECT singleton, value FROM preference WHERE derived = 'remote!'",
+            ),
+        ] {
+            let temp_file = NamedTempFile::new().unwrap();
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let db = turso_core::Database::open(
+                io.clone(),
+                temp_file.path().to_str().unwrap(),
+                turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true)),
+            )
+            .unwrap();
+            let db = Arc::new(DatabaseTape::new(db));
+
+            let mut gen = genawaiter::sync::Gen::new({
+                let db = db.clone();
+                |coro| async move {
+                    let coro: Coro<()> = coro.into();
+                    let conn = db.connect(&coro).await.unwrap();
+                    conn.execute(preference_schema)
+                        .unwrap();
+                    conn.execute("CREATE TABLE marker (singleton INTEGER PRIMARY KEY) STRICT")
+                        .unwrap();
+                    conn.execute(
+                        "CREATE TABLE collated (key TEXT PRIMARY KEY COLLATE NOCASE, value TEXT)",
+                    )
+                    .unwrap();
+                    conn.execute("INSERT INTO preference VALUES (1, 'local')")
+                        .unwrap();
+                    conn.execute("INSERT INTO marker VALUES (1)").unwrap();
+                    conn.execute("INSERT INTO collated VALUES ('ABC', 'local')")
+                        .unwrap();
+
+                    let mut session = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: false,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                                change_id: 1,
+                                change_time: 1,
+                                table_name: "preference".to_string(),
+                                id: 1,
+                                change: DatabaseTapeRowChangeType::Insert {
+                                    after: crate::alloc::vec![
+                                        turso_core::Value::from_i64(1),
+                                        turso_core::Value::build_text("remote"),
+                                    ],
+                                },
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                                change_id: 2,
+                                change_time: 1,
+                                table_name: "marker".to_string(),
+                                id: 1,
+                                change: DatabaseTapeRowChangeType::Insert {
+                                    after: crate::alloc::vec![turso_core::Value::from_i64(1)],
+                                },
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                                change_id: 3,
+                                change_time: 1,
+                                table_name: "collated".to_string(),
+                                id: 1,
+                                change: DatabaseTapeRowChangeType::Insert {
+                                    after: crate::alloc::vec![
+                                        turso_core::Value::build_text("abc"),
+                                        turso_core::Value::build_text("remote"),
+                                    ],
+                                },
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+
+                    let mut stmt = conn
+                        .prepare(preference_query)
+                        .unwrap();
+                    let mut rows = Vec::new();
+                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    let mut marker = conn.prepare("SELECT count(*) FROM marker").unwrap();
+                    let count = run_stmt_once(&coro, &mut marker)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .get_value(0)
+                        .clone();
+                    let mut collated = conn.prepare("SELECT key, value FROM collated").unwrap();
+                    let mut collated_rows = Vec::new();
+                    while let Some(row) = run_stmt_once(&coro, &mut collated).await.unwrap() {
+                        collated_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    (rows, count, collated_rows)
+                }
+            });
+            let (rows, marker_count, collated_rows) = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            assert_eq!(
+                rows,
+                vec![vec![
+                    turso_core::Value::from_i64(1),
+                    turso_core::Value::build_text("remote"),
+                ]]
+            );
+            assert_eq!(marker_count, turso_core::Value::from_i64(1));
+            assert_eq!(
+                collated_rows,
+                vec![vec![
+                    turso_core::Value::build_text("abc"),
+                    turso_core::Value::build_text("remote"),
+                ]]
+            );
+        }
+    }
+
+    #[test]
     pub fn test_implicit_rowid_replay_prefers_explicit_primary_key() {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
@@ -2078,6 +2231,206 @@ mod tests {
     }
 
     #[test]
+    fn replay_identical_blob_key_insert_does_not_update() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            temp_file.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new(|coro| async {
+            let coro: Coro<()> = coro.into();
+            let conn = db.connect(&coro).await.unwrap();
+            conn.execute(
+                "CREATE TABLE t(sha BLOB PRIMARY KEY, body BLOB NOT NULL, note TEXT) STRICT",
+            )
+            .unwrap();
+            conn.execute("CREATE TRIGGER immutable BEFORE UPDATE ON t BEGIN SELECT RAISE(ABORT, 'append-only'); END")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (X'01', X'02', NULL)")
+                .unwrap();
+
+            let mut session = db
+                .start_replay_session(
+                    &coro,
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                )
+                .await
+                .unwrap();
+            session
+                .replay(
+                    &coro,
+                    DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                        change_id: 1,
+                        change_time: 1,
+                        table_name: "t".to_string(),
+                        id: 1,
+                        change: DatabaseTapeRowChangeType::Insert {
+                            after: crate::alloc::vec![
+                                turso_core::Value::from_slice(&[1]).unwrap(),
+                                turso_core::Value::from_slice(&[2]).unwrap(),
+                                turso_core::Value::Null,
+                            ],
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+            session
+                .replay(&coro, DatabaseTapeOperation::Commit)
+                .await
+                .unwrap();
+
+            let mut stmt = conn.prepare("SELECT sha, body, note FROM t").unwrap();
+            let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+            assert_eq!(
+                row.get_values().cloned().collect::<Vec<_>>(),
+                vec![
+                    turso_core::Value::from_slice(&[1]).unwrap(),
+                    turso_core::Value::from_slice(&[2]).unwrap(),
+                    turso_core::Value::Null,
+                ]
+            );
+            assert!(run_stmt_once(&coro, &mut stmt).await.unwrap().is_none());
+
+            conn.execute("CREATE TABLE mutable(k TEXT PRIMARY KEY COLLATE NOCASE, body BLOB)")
+                .unwrap();
+            conn.execute("INSERT INTO mutable VALUES ('ABC', X'02')")
+                .unwrap();
+            let mut session = db
+                .start_replay_session(
+                    &coro,
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                )
+                .await
+                .unwrap();
+            for (change_id, key, body) in [(2, "abc", 2), (3, "abc", 3)] {
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id,
+                            change_time: change_id as u64,
+                            table_name: "mutable".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Insert {
+                                after: crate::alloc::vec![
+                                    turso_core::Value::build_text(key),
+                                    turso_core::Value::from_slice(&[body]).unwrap(),
+                                ],
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            session
+                .replay(&coro, DatabaseTapeOperation::Commit)
+                .await
+                .unwrap();
+            let mut stmt = conn.prepare("SELECT k, body FROM mutable").unwrap();
+            let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+            assert_eq!(
+                row.get_values().cloned().collect::<Vec<_>>(),
+                vec![
+                    turso_core::Value::build_text("abc"),
+                    turso_core::Value::from_slice(&[3]).unwrap(),
+                ]
+            );
+
+            let mut session = db
+                .start_replay_session(
+                    &coro,
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let error = session
+                .replay(
+                    &coro,
+                    DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                        change_id: 4,
+                        change_time: 4,
+                        table_name: "t".to_string(),
+                        id: 1,
+                        change: DatabaseTapeRowChangeType::Insert {
+                            after: crate::alloc::vec![
+                                turso_core::Value::from_slice(&[1]).unwrap(),
+                                turso_core::Value::from_slice(&[3]).unwrap(),
+                                turso_core::Value::Null,
+                            ],
+                        },
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("append-only"), "{error}");
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_compares_storage_classes_and_binary_text() {
+        for (column, initial, incoming, unchanged) in [
+            ("ANY", "1", turso_core::Value::from_i64(1), true),
+            ("ANY", "1", turso_core::Value::from_f64(1.0), false),
+            (
+                "TEXT COLLATE NOCASE",
+                "'ABC'",
+                turso_core::Value::build_text("ABC"),
+                true,
+            ),
+            (
+                "TEXT COLLATE NOCASE",
+                "'ABC'",
+                turso_core::Value::build_text("abc"),
+                false,
+            ),
+        ] {
+            let ddl = format!("CREATE TABLE t(k BLOB PRIMARY KEY, value {column}) STRICT");
+            let insert = format!("INSERT INTO t VALUES (X'01', {initial})");
+            let result = replay_on_table_with_generated_columns(
+                &[
+                    &ddl,
+                    &insert,
+                    "CREATE TRIGGER immutable BEFORE UPDATE ON t BEGIN SELECT RAISE(ABORT, 'append-only'); END",
+                ],
+                vec![DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                    change_id: 1,
+                    change_time: 1,
+                    table_name: "t".to_string(),
+                    id: 1,
+                    change: DatabaseTapeRowChangeType::Insert {
+                        after: crate::alloc::vec![
+                            turso_core::Value::from_slice(&[1]).unwrap(),
+                            incoming,
+                        ],
+                    },
+                })],
+                "SELECT count(*) FROM t",
+            );
+            if unchanged {
+                assert_eq!(result.unwrap(), vec![vec![turso_core::Value::from_i64(1)]]);
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("append-only"), "{error}");
+            }
+        }
+    }
+
+    #[test]
     pub fn test_database_tape_replay_create_index() {
         let temp_file1 = NamedTempFile::new().unwrap();
         let db_path1 = temp_file1.path().to_str().unwrap();
@@ -2971,8 +3324,7 @@ mod tests {
                 }
 
                 // Verify: 'a' should be upserted then deleted, 'b' upserted.
-                // The pre-ALTER upsert for 'b' uses ON CONFLICT(x) DO UPDATE SET x=.., y=..
-                // which doesn't touch z, so the pre-existing z='z2' is preserved.
+                // The pre-ALTER upsert has no z value, so it preserves the existing z.
                 let mut rows = Vec::new();
                 let mut stmt = conn2.prepare("SELECT x, y, z FROM t ORDER BY x").unwrap();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {

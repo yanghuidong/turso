@@ -5422,6 +5422,18 @@ mod tests {
                 origin_client_id: "client-a".to_string(),
                 ops: vec![logical_upsert_op("", 7, 2, "local-overwrite")],
             },
+            LogicalTxnData {
+                end_offset: 6,
+                commit_ts: 6,
+                origin_client_id: String::new(),
+                ops: vec![LogicalOp {
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::build_text("local"),
+                    ]),
+                    ..logical_upsert_op("preference", 0, 1, "")
+                }],
+            },
         ];
         std::fs::write(txns_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
@@ -5445,6 +5457,15 @@ mod tests {
             let txns_file = txns_file.clone();
             move |coro| async move {
                 let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE preference (singleton INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT")
+                    .unwrap();
+                conn.execute("INSERT INTO preference VALUES (1, 'local')")
+                    .unwrap();
+                assert!(super::max_local_change_id(&coro, &conn)
+                    .await
+                    .unwrap()
+                    .is_some());
                 let opts = DatabaseReplaySessionOpts {
                     use_implicit_rowid: true,
                 };
@@ -5465,16 +5486,27 @@ mod tests {
                     .await
                     .unwrap();
 
-                let conn = db.connect(&coro).await.unwrap();
                 let mut stmt = conn.prepare("SELECT rowid, x FROM items").unwrap();
                 let mut rows = Vec::new();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
                     rows.push(row.get_values().cloned().collect::<Vec<_>>());
                 }
-                (stats.touched_rows, table_names_by_stable_id, rows)
+                let mut preference = conn
+                    .prepare("SELECT singleton, value FROM preference")
+                    .unwrap();
+                let mut preference_rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut preference).await.unwrap() {
+                    preference_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                (
+                    stats.touched_rows,
+                    table_names_by_stable_id,
+                    rows,
+                    preference_rows,
+                )
             }
         });
-        let (touched_rows, table_names_by_stable_id, rows) = loop {
+        let (touched_rows, table_names_by_stable_id, rows, preference_rows) = loop {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result,
@@ -5485,6 +5517,7 @@ mod tests {
         assert!(!table_names_by_stable_id.contains_key(&99));
         assert!(touched_rows.contains(&("items".to_string(), 2)));
         assert!(!touched_rows.contains(&("items".to_string(), 1)));
+        assert!(touched_rows.contains(&("preference".to_string(), 1)));
         assert_eq!(
             rows,
             vec![vec![
@@ -5492,6 +5525,108 @@ mod tests {
                 turso_core::Value::Text(turso_core::types::Text::new("remote".to_string())),
             ]]
         );
+        assert_eq!(
+            preference_rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::build_text("local"),
+            ]]
+        );
+    }
+
+    #[test]
+    fn file_backed_logical_replay_skips_identical_missing_origin_row() {
+        let db_temp = NamedTempFile::new().unwrap();
+        let txns_temp = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let txn = LogicalTxnData {
+            end_offset: 1,
+            commit_ts: 1,
+            origin_client_id: String::new(),
+            ops: vec![LogicalOp {
+                op_type: LogicalOpType::UpsertRow as i32,
+                table_name: "evidence".to_string(),
+                rowid: 1,
+                record: record(&[
+                    turso_core::Value::from_slice(&[1]).unwrap(),
+                    turso_core::Value::from_slice(&[2]).unwrap(),
+                ]),
+                sql: String::new(),
+                user_version: None,
+                application_id: None,
+                schema_action: None,
+                schema_kind: None,
+                schema_name: String::new(),
+                stable_table_id: 0,
+            }],
+        };
+        std::fs::write(txns_temp.path(), encoded_logical_txns(&[txn])).unwrap();
+
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+        let txns_file = io
+            .open_file(
+                txns_temp.path().to_str().unwrap(),
+                turso_core::OpenFlags::None,
+                false,
+            )
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new(|coro| async {
+            let coro: Coro<()> = coro.into();
+            let conn = db.connect(&coro).await.unwrap();
+            conn.execute("CREATE TABLE evidence(sha BLOB PRIMARY KEY, body BLOB) STRICT")
+                .unwrap();
+            conn.execute("CREATE TRIGGER immutable BEFORE UPDATE ON evidence BEGIN SELECT RAISE(ABORT, 'append-only'); END")
+                .unwrap();
+            conn.execute("INSERT INTO evidence VALUES (X'01', X'02')")
+                .unwrap();
+
+            let mut replay = db
+                .start_replay_session(
+                    &coro,
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut table_names_by_stable_id = BTreeMap::new();
+            let stats =
+                apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                    &coro,
+                    &mut replay,
+                    &txns_file,
+                    "client-a",
+                    &mut table_names_by_stable_id,
+                )
+                .await
+                .unwrap();
+            replay
+                .replay(&coro, DatabaseTapeOperation::Commit)
+                .await
+                .unwrap();
+            assert!(stats.touched_rows.contains(&("evidence".to_string(), 1)));
+
+            let mut stmt = conn.prepare("SELECT sha, body FROM evidence").unwrap();
+            let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+            assert_eq!(
+                row.get_values().cloned().collect::<Vec<_>>(),
+                vec![
+                    turso_core::Value::from_slice(&[1]).unwrap(),
+                    turso_core::Value::from_slice(&[2]).unwrap(),
+                ]
+            );
+            assert!(run_stmt_once(&coro, &mut stmt).await.unwrap().is_none());
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap();
+        }
     }
 
     #[test]
